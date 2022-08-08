@@ -32,6 +32,10 @@
 #include "apt_consumer_task.h"
 #include "apt_log.h"
 #include "vosk_api.h"
+#include <apr_xml.h>
+#include "string.h"
+#include <regex.h>
+#include <stdlib.h>
 
 
 #define RECOG_ENGINE_TASK_NAME "Vosk Recog Engine"
@@ -106,6 +110,8 @@ struct vosk_recog_channel_t {
 	mpf_activity_detector_t *detector;
 	/** File to write utterance to */
 	FILE                    *audio_out;
+	/** grammar */
+	apr_xml_doc 			*grammar;
 	/** Actual recognizer **/
 	VoskRecognizer          *recognizer;
 };
@@ -215,9 +221,10 @@ static mrcp_engine_channel_t* vosk_recog_engine_channel_create(mrcp_engine_t *en
 	/* create kaldi recog channel */
 	vosk_recog_channel_t *recog_channel = (vosk_recog_channel_t*)apr_palloc(pool,sizeof(vosk_recog_channel_t));
 	recog_channel->kaldi_engine = (vosk_recog_engine_t*)engine->obj;
-        recog_channel->recognizer = NULL;
+    recog_channel->recognizer = NULL;
 	recog_channel->recog_request = NULL;
 	recog_channel->stop_response = NULL;
+	recog_channel->grammar = NULL;
 	recog_channel->detector = mpf_activity_detector_create(pool);
 	recog_channel->audio_out = NULL;
 
@@ -248,6 +255,7 @@ static mrcp_engine_channel_t* vosk_recog_engine_channel_create(mrcp_engine_t *en
 /** Destroy engine channel */
 static apt_bool_t vosk_recog_channel_destroy(mrcp_engine_channel_t *channel)
 {
+	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"channel destory %s", channel->id.buf);
 	/* nothing to destrtoy */
 	return TRUE;
 }
@@ -346,6 +354,30 @@ static apt_bool_t vosk_recog_channel_timers_start(mrcp_engine_channel_t *channel
 	return mrcp_engine_channel_message_send(channel,response);
 }
 
+static apt_bool_t check_grammar(apr_xml_doc *doc)
+{
+	const apr_xml_elem *elem;
+	const apr_xml_elem *child;
+	const apr_xml_elem *root;
+	const apr_xml_attr *attr;
+
+	if(!doc) {
+		apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"doc is null");
+		return FALSE;
+	}
+
+	root = doc->root;
+
+	/* Match document name */
+	if(!root || strcasecmp(root->name,"grammar") != 0) {
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Unknown Document <%s>",root ? root->name : "null");
+		return FALSE;
+	}
+
+	apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Document <%s>",root ? root->name : "null");
+	return TRUE;
+}
+
 /** Dispatch MRCP request */
 static apt_bool_t vosk_recog_channel_request_dispatch(mrcp_engine_channel_t *channel, mrcp_message_t *request)
 {
@@ -356,7 +388,69 @@ static apt_bool_t vosk_recog_channel_request_dispatch(mrcp_engine_channel_t *cha
 			break;
 		case RECOGNIZER_GET_PARAMS:
 			break;
-		case RECOGNIZER_DEFINE_GRAMMAR:
+		case RECOGNIZER_DEFINE_GRAMMAR: {
+				const char * pattern = "<grammar.*</grammar>";
+				regmatch_t pmatch[1];
+				char res[4096] = {'\0'};
+				const size_t nmatch = 1;
+				regex_t reg;
+				int cflags = REG_EXTENDED;
+				int status;
+
+				apr_pool_t *pool = request->pool;
+				apr_xml_parser *parser;
+				char errbuf[4096];
+				apr_status_t rv;
+
+				vosk_recog_channel_t *recog_channel = (vosk_recog_channel_t*)channel->method_obj;
+
+				// 只获取有效的音频
+				status = regcomp(&reg, pattern, cflags);
+				if(status != REG_NOERROR){
+					apt_log(APT_LOG_MARK, APT_PRIO_ERROR, "Error regcomp");
+					return FALSE;
+				}
+				status = regexec(&reg, request->body.buf, nmatch, pmatch, 0);
+				if(status == REG_NOERROR){
+					// grammar 超过字符长度限制
+					if ((pmatch[0].rm_eo-pmatch[0].rm_so)>=4096) {
+						apt_log(APT_LOG_MARK, APT_PRIO_ERROR, "Grammar length over size");
+						return FALSE;
+					}
+					for (size_t i = pmatch[0].rm_so, j = 0; i < pmatch[0].rm_eo; i++,j++){
+						res[j] = request->body.buf[i];
+					}
+					apt_log(APT_LOG_MARK, APT_PRIO_DEBUG, "Match: %s", res);
+				} else {
+					apt_log(APT_LOG_MARK, APT_PRIO_ERROR, "Error No Match: %s", request->body.buf);
+					return FALSE;
+				}
+				regfree(&reg);
+
+				parser = apr_xml_parser_create(pool);
+				if (!parser) {
+					apt_log(APT_LOG_MARK, APT_PRIO_ERROR, "Error create xml paser");
+					return FALSE;
+				}
+				rv = apr_xml_parser_feed(parser, request->body.buf, strlen(request->body.buf));
+				if (rv != APR_SUCCESS) {
+					apr_xml_parser_geterror(parser, errbuf, sizeof(errbuf));
+					apt_log(APT_LOG_MARK, APT_PRIO_ERROR, "Error parsing grammar XML: %d %pm: %s",
+						rv, &rv, errbuf);
+					return FALSE;
+				}
+				rv = apr_xml_parser_done(parser, &(recog_channel->grammar));
+				if (rv != APR_SUCCESS) {
+					apr_xml_parser_geterror(parser, errbuf, sizeof(errbuf));
+					apt_log(APT_LOG_MARK, APT_PRIO_ERROR, "Error parsing grammar XML done: %d %pm: %s",
+						rv, &rv, errbuf);
+					return FALSE;
+				}
+				// grammar 不匹配
+				if (!check_grammar(recog_channel->grammar)){
+					return FALSE;
+				}
+			}
 			break;
 		case RECOGNIZER_RECOGNIZE:
 			processed = vosk_recog_channel_recognize(channel,request,response);
@@ -417,7 +511,7 @@ static apt_bool_t vosk_recog_start_of_input(vosk_recog_channel_t *recog_channel)
 
 
 /* Raise kaldi RECOGNITION-COMPLETE event */
-static apt_bool_t vosk_recog_recognition_complete(vosk_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause)
+static apt_bool_t vosk_recog_recognition_complete(vosk_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause, char *early)
 {
 	mrcp_recog_header_t *recog_header;
 	/* create RECOGNITION-COMPLETE event */
@@ -442,7 +536,15 @@ static apt_bool_t vosk_recog_recognition_complete(vosk_recog_channel_t *recog_ch
 	if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
 		{
 			const char *result = vosk_recognizer_result(recog_channel->recognizer);
-			apt_string_assign_n(&message->body,result,strlen(result),message->pool);
+			if(early){
+				char * buffer = (char *)malloc(strlen(result)+strlen(early));
+				strcpy(buffer,result);
+				strcat(buffer,early);
+				apt_string_assign_n(&message->body,buffer,strlen(buffer),message->pool);
+				free((void *)buffer);
+			}else{
+				apt_string_assign_n(&message->body,result,strlen(result),message->pool);
+			}
 		}
 		{
 			/* get/allocate generic header */
@@ -460,6 +562,61 @@ static apt_bool_t vosk_recog_recognition_complete(vosk_recog_channel_t *recog_ch
 	return mrcp_engine_channel_message_send(recog_channel->channel,message);
 }
 
+/** Process parsed XML document */
+static char* prase_grammar(apr_xml_doc *doc,const char *result)
+{
+	const apr_xml_elem *elem;
+	const apr_xml_elem *child;
+	const apr_xml_attr *attr;
+
+	
+    regmatch_t pmatch[1];
+    const size_t nmatch = 1;
+    regex_t reg;
+    int cflags = REG_EXTENDED;
+    int status;
+    
+	/* Navigate through document */
+	for (elem = doc->root->first_child; elem; elem = elem->next) {
+		char *id = NULL;
+		if(!elem || strcasecmp(elem->name,"rule") == 0) {
+			for (attr = elem->attr; attr; attr = attr->next) {
+				if(strcasecmp(attr->name,"id") == 0) {
+					id = attr->value;
+				}
+			}
+			if(elem->first_child){
+				for(child = elem->first_child; child; child = child->next) {
+					if(!child->first_cdata.first || !child->first_cdata.first->text){
+						continue;
+					}
+					char *pattern = (char *)malloc(strlen(child->first_cdata.first->text)+1);
+					strcpy(pattern, child->first_cdata.first->text);
+					strcat(pattern,".");
+					// if(strstr(result,child->first_cdata.first->text)){
+					// 	apt_log(APT_LOG_MARK, APT_PRIO_DEBUG, "Match id <%s> child <%s> result <%s>", id, child->first_cdata.first->text, result);
+					// 	regfree(&reg);
+					// 	return id;
+					// }
+					// init regex
+					status = regcomp(&reg, pattern, cflags);
+					if(status != REG_NOERROR){
+						return NULL;
+					}
+					// exec regex
+					status = regexec(&reg, result, nmatch, pmatch, 0);
+					regfree(&reg);
+					free((void*)pattern);
+					if(status == REG_NOERROR){
+						return id;
+					}
+				}
+			}
+		}
+	}
+	return NULL;
+}
+
 /** Callback is called from MPF engine context to write/send new frame */
 static apt_bool_t vosk_recog_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame)
 {
@@ -474,6 +631,7 @@ static apt_bool_t vosk_recog_stream_write(mpf_audio_stream_t *stream, const mpf_
 
 	if(recog_channel->recog_request) {
 		mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector,frame);
+		int end = 0;
 		switch(det_event) {
 			case MPF_DETECTOR_EVENT_ACTIVITY:
 				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Activity " APT_SIDRES_FMT,
@@ -483,13 +641,15 @@ static apt_bool_t vosk_recog_stream_write(mpf_audio_stream_t *stream, const mpf_
 			case MPF_DETECTOR_EVENT_INACTIVITY:
 				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Inactivity " APT_SIDRES_FMT,
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
-				vosk_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+				vosk_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS,NULL);
+				end = 1;
 				break;
 			case MPF_DETECTOR_EVENT_NOINPUT:
 				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Noinput " APT_SIDRES_FMT,
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
 				if(recog_channel->timers_started == TRUE) {
-					vosk_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
+					vosk_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT,NULL);
+					end = 1;
 				}
 				break;
 			default:
@@ -516,8 +676,22 @@ static apt_bool_t vosk_recog_stream_write(mpf_audio_stream_t *stream, const mpf_
 			fwrite(frame->codec_frame.buffer,1,frame->codec_frame.size,recog_channel->audio_out);
 		}
 		if(recog_channel->recognizer) {
-			if (vosk_recognizer_accept_waveform(recog_channel->recognizer, (const char*)frame->codec_frame.buffer, frame->codec_frame.size)) {
-				vosk_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+			int ret = -1;
+			ret = vosk_recognizer_accept_waveform(recog_channel->recognizer, (const char*)frame->codec_frame.buffer, frame->codec_frame.size);
+			if (ret) {
+				vosk_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS,NULL);
+			} else if (ret == 0 && end == 0) {
+				const char *result = vosk_recognizer_partial_result(recog_channel->recognizer);
+				const char *early = prase_grammar(recog_channel->grammar, result);
+				if (early) {
+					// apt_log(APT_LOG_MARK, APT_PRIO_INFO, "Match id <%s>", early);
+					char *buffer = (char *)malloc(strlen(early)+21);
+					strcpy(buffer,"<earlyres>");
+					strcat(buffer, early);
+					strcat(buffer,"</earlyres>");
+					vosk_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS, buffer);
+					free((void *)buffer);
+				} 
 			}
 		}
 	}
